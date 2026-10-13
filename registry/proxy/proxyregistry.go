@@ -34,6 +34,24 @@ type proxyingRegistry struct {
 	remoteURL         url.URL
 	authChallenger    authChallenger
 	basicAuth         auth.CredentialStore
+	// readOnly, when true, disables all local cache writes. Content is still
+	// served from the remote registry (pass-through), but nothing is written
+	// to local storage. Set at construction time via SetReadOnly, mirroring
+	// the maintenance readonly mode enforced by the HTTP handlers.
+	readOnly bool
+}
+
+// ReadOnlySetter is implemented by registries that can be switched to
+// read-only mode, in which local cache writes are disabled.
+type ReadOnlySetter interface {
+	SetReadOnly(readOnly bool)
+}
+
+// SetReadOnly enables or disables local cache writes for this registry.
+// When readOnly is true, pull-through reads serve content from the remote
+// registry without caching it locally.
+func (pr *proxyingRegistry) SetReadOnly(readOnly bool) {
+	pr.readOnly = readOnly
 }
 
 // NewRegistryPullThroughCache creates a registry acting as a pull through cache
@@ -206,6 +224,7 @@ func (pr *proxyingRegistry) Repository(ctx context.Context, name reference.Named
 			cacheWriteTimeout: pr.cacheWriteTimeout,
 			repositoryName:    name,
 			authChallenger:    pr.authChallenger,
+			readOnly:          pr.readOnly,
 		},
 		manifests: &proxyManifestStore{
 			repositoryName:  name,
@@ -215,12 +234,14 @@ func (pr *proxyingRegistry) Repository(ctx context.Context, name reference.Named
 			scheduler:       pr.scheduler,
 			ttl:             pr.ttl,
 			authChallenger:  pr.authChallenger,
+			readOnly:        pr.readOnly,
 		},
 		name: name,
 		tags: &proxyTagService{
 			localTags:      localRepo.Tags(ctx),
 			remoteTags:     remoteRepo.Tags(ctx),
 			authChallenger: pr.authChallenger,
+			readOnly:       pr.readOnly,
 		},
 	}, nil
 }

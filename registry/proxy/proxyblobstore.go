@@ -25,6 +25,9 @@ type proxyBlobStore struct {
 	cacheWriteTimeout time.Duration
 	repositoryName    reference.Named
 	authChallenger    authChallenger
+	// readOnly, when true, disables local cache writes. Reads still serve
+	// content from the remote registry, but nothing is written locally.
+	readOnly bool
 }
 
 var _ distribution.BlobStore = &proxyBlobStore{}
@@ -92,6 +95,14 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 	}
 
 	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
+		return err
+	}
+
+	// In read-only mode, serve content from the remote registry without
+	// caching it locally. Local cache writes are disabled, mirroring the
+	// maintenance readonly mode enforced by the HTTP handlers.
+	if pbs.readOnly {
+		_, err := pbs.copyContent(ctx, dgst, w, w.Header())
 		return err
 	}
 
@@ -197,6 +208,11 @@ func (pbs *proxyBlobStore) Get(ctx context.Context, dgst digest.Digest) ([]byte,
 	blob, err = pbs.remoteStore.Get(ctx, dgst)
 	if err != nil {
 		return []byte{}, err
+	}
+
+	// In read-only mode, return the remote blob without caching it locally.
+	if pbs.readOnly {
+		return blob, nil
 	}
 
 	_, err = pbs.localStore.Put(ctx, "", blob)

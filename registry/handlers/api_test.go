@@ -1456,6 +1456,82 @@ func TestManifestAPI_DeleteTag_ReadOnly(t *testing.T) {
 	checkResponse(t, msg, resp, http.StatusMethodNotAllowed)
 }
 
+// TestMirrorReadOnlyServesPullThrough verifies that a pull-through cache
+// registry in maintenance readonly mode still serves content pulled through
+// from upstream, while refusing blob uploads
+// (distribution/distribution#4670). The readonly gate must block writes,
+// not reads; pull-through reads must not populate the local cache.
+func TestMirrorReadOnlyServesPullThrough(t *testing.T) {
+	upstreamEnv := newTestEnv(t, true)
+	defer upstreamEnv.Shutdown()
+
+	imageName, _ := reference.WithName("foo/bar")
+	layerFile, layerDigest, err := testutil.CreateRandomTarFile()
+	if err != nil {
+		t.Fatalf("error creating random layer file: %v", err)
+	}
+
+	// Push a layer to the upstream registry only.
+	uploadURLBase, _ := startPushLayer(t, upstreamEnv, imageName)
+	pushLayer(t, upstreamEnv.builder, imageName, layerDigest, uploadURLBase, layerFile)
+
+	// Build a mirror (pull-through cache) registry in readonly mode.
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"inmemory": configuration.Parameters{},
+			"maintenance": configuration.Parameters{
+				"uploadpurging": map[any]any{
+					"enabled": false,
+				},
+				"readonly": map[any]any{
+					"enabled": true,
+				},
+			},
+		},
+		Proxy: configuration.Proxy{
+			RemoteURL: upstreamEnv.server.URL,
+		},
+		Catalog: configuration.Catalog{
+			MaxEntries: 5,
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	mirrorEnv := newTestEnvWithConfig(t, &config)
+	defer mirrorEnv.Shutdown()
+
+	// Pull the blob through the read-only mirror: must serve content.
+	ref, _ := reference.WithDigest(imageName, layerDigest)
+	layerURL, err := mirrorEnv.builder.BuildBlobURL(ref)
+	if err != nil {
+		t.Fatal("Error building blob URL")
+	}
+	resp, err := http.Get(layerURL)
+	if err != nil {
+		t.Fatalf("unexpected error pulling blob through read-only mirror: %v", err)
+	}
+	defer resp.Body.Close()
+	checkResponse(t, "pulling blob through read-only mirror", resp, http.StatusOK)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest.FromBytes(bodyBytes) != layerDigest {
+		t.Fatalf("unexpected blob content through read-only mirror: got digest %s, want %s", digest.FromBytes(bodyBytes), layerDigest)
+	}
+
+	// Starting a blob upload on the read-only mirror must be refused.
+	layerUploadURL, err := mirrorEnv.builder.BuildBlobUploadURL(imageName)
+	if err != nil {
+		t.Fatalf("unexpected error building layer upload url: %v", err)
+	}
+	resp, err = http.Post(layerUploadURL, "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error starting layer push on read-only mirror: %v", err)
+	}
+	defer resp.Body.Close()
+	checkResponse(t, "starting push on read-only mirror", resp, http.StatusMethodNotAllowed)
+}
+
 func TestManifestAPI_DeleteTag_DeleteDisabled(t *testing.T) {
 	env := newTestEnv(t, false)
 	defer env.Shutdown()

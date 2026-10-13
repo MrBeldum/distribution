@@ -20,6 +20,9 @@ type proxyManifestStore struct {
 	scheduler       *scheduler.TTLExpirationScheduler
 	ttl             *time.Duration
 	authChallenger  authChallenger
+	// readOnly, when true, disables local cache writes. Reads still serve
+	// content from the remote registry, but nothing is written locally.
+	readOnly bool
 }
 
 var _ distribution.ManifestService = &proxyManifestStore{}
@@ -63,6 +66,13 @@ func (pms proxyManifestStore) Get(ctx context.Context, dgst digest.Digest, optio
 	proxyMetrics.ManifestPush(uint64(len(payload)), !fromRemote)
 	if fromRemote {
 		proxyMetrics.ManifestPull(uint64(len(payload)))
+
+		// In read-only mode, return the remote manifest without caching it
+		// locally. Local cache writes are disabled, mirroring the
+		// maintenance readonly mode enforced by the HTTP handlers.
+		if pms.readOnly {
+			return manifest, nil
+		}
 
 		_, err = pms.localManifests.Put(ctx, manifest)
 		if err != nil {

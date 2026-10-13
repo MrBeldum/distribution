@@ -13,6 +13,9 @@ type proxyTagService struct {
 	localTags      distribution.TagService
 	remoteTags     distribution.TagService
 	authChallenger authChallenger
+	// readOnly, when true, disables local cache writes. Reads still serve
+	// content from the remote registry, but nothing is written locally.
+	readOnly bool
 }
 
 var _ distribution.TagService = proxyTagService{}
@@ -25,6 +28,13 @@ func (pt proxyTagService) Get(ctx context.Context, tag string) (v1.Descriptor, e
 	if err == nil {
 		desc, err := pt.remoteTags.Get(ctx, tag)
 		if err == nil {
+			// In read-only mode, return the remote tag association without
+			// caching it locally. Local cache writes are disabled,
+			// mirroring the maintenance readonly mode enforced by the
+			// HTTP handlers.
+			if pt.readOnly {
+				return desc, nil
+			}
 			err := pt.localTags.Tag(ctx, tag, desc)
 			if err != nil {
 				return v1.Descriptor{}, err

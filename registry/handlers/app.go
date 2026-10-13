@@ -363,6 +363,13 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 			panic(err.Error())
 		}
 		app.isCache = true
+		// Propagate the maintenance readonly mode to the proxy registry so
+		// pull-through reads serve content without writing to local storage.
+		// Without this, cache population on reads would bypass the readonly
+		// gate enforced by the HTTP handlers.
+		if ros, ok := app.registry.(proxy.ReadOnlySetter); ok {
+			ros.SetReadOnly(app.readOnly)
+		}
 		dcontext.GetLogger(app).Info("Registry configured as a proxy cache to ", config.Proxy.RemoteURL)
 	}
 	var ok bool
