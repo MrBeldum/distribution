@@ -399,7 +399,16 @@ func (lbs *linkedBlobStatter) Clear(ctx context.Context, dgst digest.Digest) (er
 		return err
 	}
 
-	return lbs.blobStore.driver.Delete(ctx, blobLinkPath)
+	if err := lbs.blobStore.driver.Delete(ctx, blobLinkPath); err != nil {
+		switch err := err.(type) {
+		case driver.PathNotFoundError:
+			return distribution.ErrBlobUnknown
+		default:
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (lbs *linkedBlobStatter) SetDescriptor(ctx context.Context, dgst digest.Digest, desc v1.Descriptor) error {

@@ -486,7 +486,7 @@ func (imh *manifestHandler) DeleteManifest(w http.ResponseWriter, r *http.Reques
 			imh.Errors = append(imh.Errors, errcode.ErrorCodeUnsupported)
 			return
 		default:
-			imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown)
+			imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 			return
 		}
 	}

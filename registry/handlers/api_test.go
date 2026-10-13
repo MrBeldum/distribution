@@ -1631,6 +1631,72 @@ func TestManifestDeleteDisabled(t *testing.T) {
 	testManifestDeleteDisabled(t, env, schema2Repo)
 }
 
+// TestManifestDeleteLayerDigest is a regression test for #4685: deleting a
+// layer digest via the manifest endpoint must return 404 MANIFEST_UNKNOWN,
+// not 500 UNKNOWN. The bug needs the blob descriptor cache enabled: the
+// manifest store shares the repository-scoped cache with the blob store, so
+// Stat succeeds for the layer digest via cache hit, and Clear must map the
+// missing manifest revision link to ErrBlobUnknown.
+func TestManifestDeleteLayerDigest(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"inmemory": configuration.Parameters{},
+			"cache":    configuration.Parameters{"blobdescriptor": "inmemory"},
+			"delete":   configuration.Parameters{"enabled": true},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+
+	schema2Repo, _ := reference.WithName("foo/schema2")
+	args := testManifestAPISchema2(t, env, schema2Repo, "schema2tag")
+
+	deserialized, ok := args.manifest.(*schema2.DeserializedManifest)
+	if !ok {
+		t.Fatalf("expected schema2 manifest, got %T", args.manifest)
+	}
+	if len(deserialized.Layers) == 0 {
+		t.Fatalf("expected manifest to have layers")
+	}
+	layerDigest := deserialized.Layers[0].Digest
+
+	// Deleting a layer digest via the manifest endpoint must be 404, not 500.
+	layerRef, _ := reference.WithDigest(schema2Repo, layerDigest)
+	layerManifestURL, err := env.builder.BuildManifestURL(layerRef)
+	if err != nil {
+		t.Fatalf("unexpected error building layer manifest url: %v", err)
+	}
+
+	resp, err := httpDelete(layerManifestURL)
+	if err != nil {
+		t.Fatalf("unexpected error deleting layer digest via manifest endpoint: %v", err)
+	}
+	defer resp.Body.Close()
+
+	checkResponse(t, "deleting layer digest via manifest endpoint", resp, http.StatusNotFound)
+	// nolint:errcheck
+	checkBodyHasErrorCodes(t, "deleting layer digest via manifest endpoint", resp, errcode.ErrorCodeManifestUnknown)
+
+	// Deleting the real manifest must still succeed.
+	manifestRef, _ := reference.WithDigest(schema2Repo, args.dgst)
+	manifestURL, err := env.builder.BuildManifestURL(manifestRef)
+	if err != nil {
+		t.Fatalf("unexpected error building manifest url: %v", err)
+	}
+
+	resp, err = httpDelete(manifestURL)
+	if err != nil {
+		t.Fatalf("unexpected error deleting manifest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	checkResponse(t, "deleting real manifest", resp, http.StatusAccepted)
+}
+
 func testManifestDeleteDisabled(t *testing.T, env *testEnv, imageName reference.Named) {
 	ref, _ := reference.WithDigest(imageName, digestSha256EmptyTar)
 	manifestURL, err := env.builder.BuildManifestURL(ref)
