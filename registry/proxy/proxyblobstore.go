@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,13 +44,103 @@ func setResponseHeaders(h http.Header, length int64, mediaType string, digest di
 	h.Set("Etag", digest.String())
 }
 
-func (pbs *proxyBlobStore) copyContent(ctx context.Context, dgst digest.Digest, writer io.Writer, h http.Header) (v1.Descriptor, error) {
+// parseRange parses a single-byte-range Range header (RFC 9110 Section 14.1.2)
+// against a representation of the given size. It returns the inclusive
+// [start, end] byte range. It reports ok=false when the header is absent,
+// malformed, requests multiple ranges, or is unsatisfiable; callers fall back
+// to serving the full representation (the pre-existing behavior).
+func parseRange(r *http.Request, size int64) (start, end int64, ok bool) {
+	const prefix = "bytes="
+	spec, found := strings.CutPrefix(r.Header.Get("Range"), prefix)
+	if !found {
+		return 0, 0, false
+	}
+	if strings.Contains(spec, ",") {
+		// Multiple ranges are not supported; serve the full body.
+		return 0, 0, false
+	}
+	startStr, endStr, found := strings.Cut(spec, "-")
+	if !found {
+		return 0, 0, false
+	}
+	if startStr == "" {
+		// Suffix range: the last N bytes.
+		suffix, err := strconv.ParseInt(endStr, 10, 64)
+		if err != nil || suffix <= 0 {
+			return 0, 0, false
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return size - suffix, size - 1, true
+	}
+	start, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, false
+	}
+	if endStr == "" {
+		end = size - 1
+	} else {
+		end, err = strconv.ParseInt(endStr, 10, 64)
+		if err != nil || end < start {
+			return 0, 0, false
+		}
+		if end >= size {
+			end = size - 1
+		}
+	}
+	if start >= size {
+		// Unsatisfiable range.
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+// rangeWriter passes through only the bytes in the inclusive [start, end]
+// window of the stream, discarding the rest. It lets a single remote fetch
+// serve a ranged response to the client while the full stream continues to
+// another writer (e.g. the local cache).
+type rangeWriter struct {
+	w     io.Writer
+	start int64 // first byte to pass through (inclusive)
+	end   int64 // last byte to pass through (inclusive)
+	pos   int64 // number of stream bytes seen so far
+}
+
+func (rw *rangeWriter) Write(p []byte) (int, error) {
+	lo := rw.pos
+	hi := rw.pos + int64(len(p)) - 1
+	rw.pos += int64(len(p))
+	if hi < rw.start || lo > rw.end {
+		// Entire chunk outside the window: discard, report consumed.
+		return len(p), nil
+	}
+	s := max(rw.start-lo, 0)
+	e := min(rw.end-lo, int64(len(p))-1)
+	if _, err := rw.w.Write(p[s : e+1]); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (pbs *proxyBlobStore) copyContent(ctx context.Context, dgst digest.Digest, w http.ResponseWriter, r *http.Request, cacheWriter io.Writer) (v1.Descriptor, error) {
 	desc, err := pbs.remoteStore.Stat(ctx, dgst)
 	if err != nil {
 		return v1.Descriptor{}, err
 	}
 
-	setResponseHeaders(h, desc.Size, desc.MediaType, dgst)
+	setResponseHeaders(w.Header(), desc.Size, desc.MediaType, dgst)
+
+	// Honor a single-byte-range Range header, if present and valid.
+	// Without this, ranged requests on a cache miss were answered with
+	// 200 and the full blob.
+	var rng *struct{ start, end int64 }
+	if start, end, ok := parseRange(r, desc.Size); ok {
+		rng = &struct{ start, end int64 }{start, end}
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, desc.Size))
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
 
 	remoteReader, err := pbs.remoteStore.Open(ctx, dgst)
 	if err != nil {
@@ -56,6 +148,20 @@ func (pbs *proxyBlobStore) copyContent(ctx context.Context, dgst digest.Digest, 
 	}
 
 	defer remoteReader.Close()
+
+	if rng != nil {
+		// Send 206 only after the remote stream opened successfully, so a
+		// failed open can still surface as an error response.
+		w.WriteHeader(http.StatusPartialContent)
+	}
+
+	var writer io.Writer = w
+	if rng != nil {
+		writer = &rangeWriter{w: w, start: rng.start, end: rng.end}
+	}
+	if cacheWriter != nil {
+		writer = io.MultiWriter(writer, cacheWriter)
+	}
 
 	_, err = io.CopyN(writer, remoteReader, desc.Size)
 	if err != nil {
@@ -102,7 +208,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 		// Will return the blob from the remote store directly.
 		// TODO Maybe we could reuse the these blobs are serving remotely and caching locally.
 		mu.Unlock()
-		_, err := pbs.copyContent(ctx, dgst, w, w.Header())
+		_, err := pbs.copyContent(ctx, dgst, w, r, nil)
 		return err
 	}
 	inflight[dgst] = struct{}{}
@@ -138,8 +244,7 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 
 	// Serving client and storing locally over same fetching request.
 	// This can prevent a redundant blob fetching.
-	multiWriter := io.MultiWriter(w, bw)
-	desc, err := pbs.copyContent(ctx, dgst, multiWriter, w.Header())
+	desc, err := pbs.copyContent(ctx, dgst, w, r, bw)
 	if err != nil {
 		return err
 	}
